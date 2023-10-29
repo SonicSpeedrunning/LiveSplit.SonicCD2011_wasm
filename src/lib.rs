@@ -12,6 +12,7 @@
 use asr::{
     file_format::pe,
     future::{next_tick, retry},
+    settings::Gui,
     signature::Signature,
     time::Duration,
     timer::{self, TimerState},
@@ -23,7 +24,7 @@ asr::panic_handler!();
 asr::async_main!(nightly);
 
 async fn main() {
-    let settings = Settings::register();
+    let mut settings = Settings::register();
 
     loop {
         // Hook to the target process
@@ -44,6 +45,7 @@ async fn main() {
                     // 2. If the timer is currently either running or paused, then the isLoading, gameTime, and reset actions will be run.
                     // 3. If reset does not return true, then the split action will be run.
                     // 4. If the timer is currently not running (and not paused), then the start action will be run.
+                    settings.update();
                     update_loop(&process, &addresses, &mut watchers);
 
                     let timer_state = timer::state();
@@ -87,7 +89,7 @@ async fn main() {
     }
 }
 
-#[derive(asr::Settings)]
+#[derive(Gui)]
 struct Settings {
     #[default = true]
     /// START --> Enable auto start
@@ -456,7 +458,9 @@ impl Addresses {
 
 fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
     // LiveSplit's timer state, defined inside a watcher in order to define some actions when the timer starts or resets
-    let Some(timer_state) = watchers.livesplit_timer_state.update(Some(timer::state())) else { return };
+    let Some(timer_state) = watchers.livesplit_timer_state.update(Some(timer::state())) else {
+        return;
+    };
 
     // Update standard values
     watchers.demo_mode.update(Some(
@@ -491,26 +495,26 @@ fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
                 1 => Acts::MainMenu,
                 2 => Acts::TimeAttack,
                 8 => Acts::Credits,
-                100 | 101 | 102 | 103 => Acts::PalmtreePanicAct1,
-                104 | 105 | 106 | 107 => Acts::PalmtreePanicAct2,
+                100..=103 => Acts::PalmtreePanicAct1,
+                104..=107 => Acts::PalmtreePanicAct2,
                 108 | 109 => Acts::PalmtreePanicAct3,
-                110 | 111 | 112 | 113 => Acts::CollisionChaosAct1,
-                114 | 115 | 116 | 117 => Acts::CollisionChaosAct2,
+                110..=113 => Acts::CollisionChaosAct1,
+                114..=117 => Acts::CollisionChaosAct2,
                 118 | 119 => Acts::CollisionChaosAct3,
-                120 | 121 | 122 | 123 => Acts::TidalTempestAct1,
-                124 | 125 | 126 | 127 => Acts::TidalTempestAct2,
+                120..=123 => Acts::TidalTempestAct1,
+                124..=127 => Acts::TidalTempestAct2,
                 128 | 129 => Acts::TidalTempestAct3,
-                130 | 131 | 132 | 133 => Acts::QuartzQuadrantAct1,
-                134 | 135 | 136 | 137 => Acts::QuartzQuadrantAct2,
+                130..=133 => Acts::QuartzQuadrantAct1,
+                134..=137 => Acts::QuartzQuadrantAct2,
                 138 | 139 => Acts::QuartzQuadrantAct3,
-                140 | 141 | 142 | 143 => Acts::WackyWorkbenchAct1,
-                144 | 145 | 146 | 147 => Acts::WackyWorkbenchAct2,
+                140..=143 => Acts::WackyWorkbenchAct1,
+                144..=147 => Acts::WackyWorkbenchAct2,
                 148 | 149 => Acts::WackyWorkbenchAct3,
-                150 | 151 | 152 | 153 => Acts::StardustSpeedwayAct1,
-                154 | 155 | 156 | 157 => Acts::StardustSpeedwayAct2,
+                150..=153 => Acts::StardustSpeedwayAct1,
+                154..=157 => Acts::StardustSpeedwayAct2,
                 158 | 159 => Acts::StardustSpeedwayAct3,
-                160 | 161 | 162 | 163 => Acts::MetallicMadnessAct1,
-                164 | 165 | 166 | 167 => Acts::MetallicMadnessAct2,
+                160..=163 => Acts::MetallicMadnessAct1,
+                164..=167 => Acts::MetallicMadnessAct2,
                 168 | 169 => Acts::MetallicMadnessAct3,
                 _ => match &watchers.level_id.pair {
                     Some(x) => x.current,
@@ -538,8 +542,12 @@ fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
     };
 
     // IGT logic
-    let Some(demo_mode) = &watchers.demo_mode.pair else { return };
-    let Some(timer_is_running) = &watchers.timer_is_running.pair else { return };
+    let Some(demo_mode) = &watchers.demo_mode.pair else {
+        return;
+    };
+    let Some(timer_is_running) = &watchers.timer_is_running.pair else {
+        return;
+    };
 
     let centisecs = (game
         .read::<u8>(addresses.centisecs)
@@ -547,7 +555,12 @@ fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
         .unwrap_or_default() as u64
         * 100)
         / 60;
-    let Some(centis) = watchers.centisecs.update(Some(Duration::milliseconds(centisecs as i64 * 10))) else { return };
+    let Some(centis) = watchers
+        .centisecs
+        .update(Some(Duration::milliseconds(centisecs as i64 * 10)))
+    else {
+        return;
+    };
 
     let new_igt =
         if demo_mode.current || demo_mode.old || timer_state.current == TimerState::NotRunning {
@@ -570,7 +583,9 @@ fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
                     } * 10) as i64,
             )
         };
-    let Some(final_igt) = watchers.igt.update(Some(new_igt)) else { return };
+    let Some(final_igt) = watchers.igt.update(Some(new_igt)) else {
+        return;
+    };
 
     // Reset the buffer IGT variables when the timer is stopped
     if timer_state.current == TimerState::NotRunning {
@@ -593,7 +608,12 @@ fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
     }
 
     // Time bonus start value
-    let Some(time_bonus) = watchers.time_bonus.update(game.read::<u32>(addresses.time_bonus).ok()) else { return };
+    let Some(time_bonus) = watchers
+        .time_bonus
+        .update(game.read::<u32>(addresses.time_bonus).ok())
+    else {
+        return;
+    };
     if time_bonus.old == 0 && time_bonus.changed() {
         watchers.time_bonus_start_value = time_bonus.current
     } else if time_bonus.current == 0 {
@@ -605,13 +625,19 @@ fn start(watchers: &Watchers, settings: &Settings) -> bool {
     if !settings.start {
         return false;
     }
-    let Some(act) = &watchers.level_id.pair else { return false };
-    let Some(state) = &watchers.state.pair else { return false };
+    let Some(act) = &watchers.level_id.pair else {
+        return false;
+    };
+    let Some(state) = &watchers.state.pair else {
+        return false;
+    };
     act.current == Acts::MainMenu && state.current == 7 && state.old == 6
 }
 
 fn split(watchers: &Watchers, settings: &Settings) -> bool {
-    let Some(act) = &watchers.level_id.pair else {return false };
+    let Some(act) = &watchers.level_id.pair else {
+        return false;
+    };
 
     match act.old {
         Acts::PalmtreePanicAct1 => {
@@ -672,8 +698,12 @@ fn split(watchers: &Watchers, settings: &Settings) -> bool {
         }
         Acts::MetallicMadnessAct3 => {
             settings.metallic_madness_3 && {
-                let Some(finalboss_hp) = &watchers.final_boss_health.pair else { return false };
-                let Some(igt) = &watchers.igt.pair else { return false };
+                let Some(finalboss_hp) = &watchers.final_boss_health.pair else {
+                    return false;
+                };
+                let Some(igt) = &watchers.igt.pair else {
+                    return false;
+                };
                 if settings.rta_tb {
                     (act.current == Acts::Credits || act.current == Acts::MainMenu)
                         && finalboss_hp.old == 0
@@ -693,14 +723,20 @@ fn reset(watchers: &Watchers, settings: &Settings) -> bool {
     if !settings.reset {
         return false;
     }
-    let Some(act) = &watchers.level_id.pair else { return false };
-    let Some(state) = &watchers.state.pair else { return false };
+    let Some(act) = &watchers.level_id.pair else {
+        return false;
+    };
+    let Some(state) = &watchers.state.pair else {
+        return false;
+    };
     act.current == Acts::MainMenu && state.current == 5 && state.changed()
 }
 
 fn is_loading(watchers: &Watchers, settings: &Settings) -> Option<bool> {
     if settings.rta_tb {
-        let Some(time_bonus) = &watchers.time_bonus.pair else { return None };
+        let Some(time_bonus) = &watchers.time_bonus.pair else {
+            return None;
+        };
         Some(
             watchers.time_bonus_start_value != 0
                 && time_bonus.current != watchers.time_bonus_start_value,
@@ -714,8 +750,12 @@ fn game_time(watchers: &Watchers, settings: &Settings, addresses: &Addresses) ->
     if settings.rta_tb {
         None
     } else {
-        let Some(igt) = &watchers.igt.pair else { return None };
-        let Some(centisecs) = &watchers.centisecs.pair else { return None };
+        let Some(igt) = &watchers.igt.pair else {
+            return None;
+        };
+        let Some(centisecs) = &watchers.centisecs.pair else {
+            return None;
+        };
         Some(
             igt.current + watchers.accumulated_igt - watchers.buffer_igt - watchers.igt_offset
                 + if addresses.has_centisecs_bug {

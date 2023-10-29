@@ -6,8 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-asr = { git = "https://github.com/CryZe/asr", features = ["signature", "derive"] }
-spinning_top = "0.2.5"
+asr = { git = "https://github.com/LiveSplit/asr", features = ["signature", "derive"] }
 
 [lib]
 crate-type = ["cdylib"]
