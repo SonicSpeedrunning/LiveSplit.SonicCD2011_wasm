@@ -10,7 +10,7 @@
 )]
 
 use asr::{
-    file_format::pe,
+    file_format::pe::{self, MachineType},
     future::{next_tick, retry},
     settings::Gui,
     signature::Signature,
@@ -28,7 +28,7 @@ async fn main() {
 
     loop {
         // Hook to the target process
-        let process = retry(|| PROCESS_NAMES.into_iter().find_map(Process::attach)).await;
+        let process = retry(|| PROCESS_NAMES.iter().find_map(|&name| Process::attach(name))).await;
 
         process
             .until_closes(async {
@@ -36,7 +36,7 @@ async fn main() {
                 let mut watchers = Watchers::default();
 
                 // Perform memory scanning to look for the addresses we need
-                let addresses = retry(|| Addresses::init(&process)).await;
+                let addresses = Addresses::init(&process).await;
 
                 loop {
                     // Splitting logic. Adapted from OG LiveSplit:
@@ -199,59 +199,83 @@ struct Addresses {
 }
 
 impl Addresses {
-    fn init(game: &Process) -> Option<Self> {
-        let main_module_base = PROCESS_NAMES
-            .into_iter()
-            .find_map(|p| game.get_module_address(p).ok())?;
-        let main_module_size = pe::read_size_of_image(game, main_module_base)? as u64;
+    async fn init(game: &Process) -> Self {
+        let main_module_base = retry(|| {
+            PROCESS_NAMES
+                .iter()
+                .find_map(|&p| game.get_module_address(p).ok())
+        })
+        .await;
+
+        let main_module_size =
+            retry(|| pe::read_size_of_image(game, main_module_base)).await as u64;
+
+        let is_64_bit =
+            retry(|| pe::MachineType::read(game, main_module_base)).await == MachineType::X86_64;
 
         // Determine game version through signature scanning
-        let is_64_bit: bool;
-        let game_version: GameVersion;
-        let has_centisecs_bug: bool;
+        // let game_version: GameVersion;
+        // let has_centisecs_bug: bool;
 
-        if SIG32_RETAIL
-            .scan_process_range(game, (main_module_base, main_module_size))
-            .is_some()
-        {
-            is_64_bit = false;
-            game_version = GameVersion::Retail;
-            has_centisecs_bug = true;
-        } else if SIG32_DECOMP_1_0_0
-            .scan_process_range(game, (main_module_base, main_module_size))
-            .is_some()
-        {
-            is_64_bit = false;
-            game_version = GameVersion::Decompilation32bit1_0_0;
-            has_centisecs_bug = SIG32_DECOMP_TIMERBUG
-                .scan_process_range(game, (main_module_base, main_module_size))
-                .is_none();
-        } else if SIG32_DECOMP_1_3_1
-            .scan_process_range(game, (main_module_base, main_module_size))
-            .is_some()
-        {
-            is_64_bit = false;
-            game_version = GameVersion::Decompilation32bit1_3_1;
-            has_centisecs_bug = false;
-        } else if SIG64_DECOMP_1_0_0
-            .scan_process_range(game, (main_module_base, main_module_size))
-            .is_some()
-        {
-            is_64_bit = true;
-            game_version = GameVersion::Decompilation64bit1_0_0;
-            has_centisecs_bug = SIG64_DECOMP_TIMERBUG
-                .scan_process_range(game, (main_module_base, main_module_size))
-                .is_none();
-        } else if SIG64_DECOMP_1_3_1
-            .scan_process_range(game, (main_module_base, main_module_size))
-            .is_some()
-        {
-            is_64_bit = true;
-            game_version = GameVersion::Decompilation64bit1_3_1;
-            has_centisecs_bug = false;
-        } else {
-            return None;
-        }
+        let (game_version, has_centisecs_bug) = retry(|| match is_64_bit {
+            false => {
+                if SIG32_RETAIL
+                    .scan_process_range(game, (main_module_base, main_module_size))
+                    .is_some()
+                {
+                    let game_version = GameVersion::Retail;
+                    let has_centisecs_bug = true;
+                    Some((game_version, has_centisecs_bug))
+                } else if SIG32_DECOMP_1_0_0
+                    .scan_process_range(game, (main_module_base, main_module_size))
+                    .is_some()
+                {
+                    let game_version = GameVersion::Decompilation32bit1_0_0;
+                    let has_centisecs_bug = SIG32_DECOMP_TIMERBUG
+                        .scan_process_range(game, (main_module_base, main_module_size))
+                        .is_none();
+                    Some((game_version, has_centisecs_bug))
+                } else if SIG32_DECOMP_1_3_1
+                    .scan_process_range(game, (main_module_base, main_module_size))
+                    .is_some()
+                {
+                    let game_version = GameVersion::Decompilation32bit1_3_1;
+                    let has_centisecs_bug = false;
+                    Some((game_version, has_centisecs_bug))
+                } else {
+                    None
+                }
+            }
+            true => {
+                if SIG64_DECOMP_1_0_0
+                    .scan_process_range(game, (main_module_base, main_module_size))
+                    .is_some()
+                {
+                    let game_version = GameVersion::Decompilation64bit1_0_0;
+                    let has_centisecs_bug = SIG64_DECOMP_TIMERBUG
+                        .scan_process_range(game, (main_module_base, main_module_size))
+                        .is_none();
+                    Some((game_version, has_centisecs_bug))
+                } else if SIG64_DECOMP_1_3_1
+                    .scan_process_range(game, (main_module_base, main_module_size))
+                    .is_some()
+                {
+                    let game_version = GameVersion::Decompilation64bit1_3_1;
+                    let has_centisecs_bug = false;
+                    Some((game_version, has_centisecs_bug))
+                } else if SIG64_DECOMP_1_3_2
+                    .scan_process_range(game, (main_module_base, main_module_size))
+                    .is_some()
+                {
+                    let game_version = GameVersion::Decompilation64bit1_3_2;
+                    let has_centisecs_bug = false;
+                    Some((game_version, has_centisecs_bug))
+                } else {
+                    None
+                }
+            }
+        })
+        .await;
 
         // Find addresses
         let ptr: Address;
@@ -272,82 +296,110 @@ impl Addresses {
 
         match game_version {
             GameVersion::Retail => {
-                ptr = game
-                    .read::<Address32>(
+                ptr = retry(|| {
+                    game.read::<Address32>(
                         SIG32_RETAIL
                             .scan_process_range(game, (main_module_base, main_module_size))?
                             + 3,
                     )
-                    .ok()?
-                    .into();
+                    .ok()
+                })
+                .await
+                .into();
             }
             GameVersion::Decompilation32bit1_0_0 => {
-                ptr = game
-                    .read::<Address32>(
+                ptr = retry(|| {
+                    game.read::<Address32>(
                         SIG32_DECOMP_1_0_0
                             .scan_process_range(game, (main_module_base, main_module_size))?
                             + 3,
                     )
-                    .ok()?
-                    .into();
+                    .ok()
+                })
+                .await
+                .into();
             }
             GameVersion::Decompilation32bit1_3_1 => {
-                ptr = game
-                    .read::<Address32>(
+                ptr = retry(|| {
+                    game.read::<Address32>(
                         SIG32_DECOMP_1_3_1
                             .scan_process_range(game, (main_module_base, main_module_size))?
                             + 3,
                     )
-                    .ok()?
-                    .into();
+                    .ok()
+                })
+                .await
+                .into();
             }
             GameVersion::Decompilation64bit1_0_0 => {
-                let addr = SIG64_DECOMP_1_0_0
-                    .scan_process_range(game, (main_module_base, main_module_size))?
+                let addr = retry(|| {
+                    SIG64_DECOMP_1_0_0
+                        .scan_process_range(game, (main_module_base, main_module_size))
+                })
+                .await
                     + 4;
-                ptr = main_module_base + game.read::<u32>(addr).ok()?;
+                ptr = main_module_base + retry(|| game.read::<u32>(addr)).await;
 
-                let addr = SIG64_DECOMP_1_0_0_LEA
-                    .scan_process_range(game, (main_module_base, main_module_size))?
+                let addr = retry(|| {
+                    SIG64_DECOMP_1_0_0_LEA
+                        .scan_process_range(game, (main_module_base, main_module_size))
+                })
+                .await
                     + 3;
-                lea = addr + 0x4 + game.read::<u32>(addr).ok()?;
+                lea = addr + 0x4 + retry(|| game.read::<u32>(addr)).await;
             }
             GameVersion::Decompilation64bit1_3_1 => {
-                let addr = SIG64_DECOMP_1_3_1
-                    .scan_process_range(game, (main_module_base, main_module_size))?
+                let addr = retry(|| {
+                    SIG64_DECOMP_1_3_1
+                        .scan_process_range(game, (main_module_base, main_module_size))
+                })
+                .await
                     + 4;
-                ptr = main_module_base + game.read::<u32>(addr).ok()?;
+                ptr = main_module_base + retry(|| game.read::<u32>(addr)).await;
 
-                let addr = SIG64_DECOMP_1_0_0_LEA
-                    .scan_process_range(game, (main_module_base, main_module_size))?
+                let addr = retry(|| {
+                    SIG64_DECOMP_1_0_0_LEA
+                        .scan_process_range(game, (main_module_base, main_module_size))
+                })
+                .await
                     + 3;
-                lea = addr + 0x4 + game.read::<u32>(addr).ok()?;
+                lea = addr + 0x4 + retry(|| game.read::<u32>(addr)).await;
+            }
+            GameVersion::Decompilation64bit1_3_2 => {
+                let addr = retry(|| {
+                    SIG64_DECOMP_1_3_2
+                        .scan_process_range(game, (main_module_base, main_module_size))
+                })
+                .await
+                    + 4;
+                ptr = main_module_base + retry(|| game.read::<u32>(addr)).await;
+
+                let addr = retry(|| {
+                    SIG64_DECOMP_1_0_0_LEA
+                        .scan_process_range(game, (main_module_base, main_module_size))
+                })
+                .await
+                    + 3;
+                lea = addr + 0x4 + retry(|| game.read::<u32>(addr)).await;
             }
         }
 
         // Scanning function
-        let pointerpath = |offset1: u32, offset2: u32, offset3: u32, absolute: bool| -> Address {
+        let pointerpath = |offset1: u32, offset2: u32, offset3: u32, absolute: bool| async move {
             if is_64_bit {
                 if offset1 == 0 {
                     return lea + offset3;
                 }
-                let temp_offset = game.read::<u32>(ptr + offset1).ok().unwrap_or_default();
+                let temp_offset = retry(|| game.read::<u32>(ptr + offset1)).await;
                 let temp_offset2 = main_module_base + temp_offset + offset2;
                 if absolute {
-                    main_module_base
-                        + game.read::<u32>(temp_offset2).ok().unwrap_or_default()
-                        + offset3
+                    main_module_base + retry(|| game.read::<u32>(temp_offset2)).await + offset3
                 } else {
-                    temp_offset2
-                        + 0x4
-                        + game.read::<u32>(temp_offset2).ok().unwrap_or_default()
-                        + offset3
+                    temp_offset2 + 0x4 + retry(|| game.read::<u32>(temp_offset2)).await + offset3
                 }
             } else {
-                (game
-                    .read_pointer_path32::<Address32>(ptr + offset1, &[0, offset2])
-                    .ok()
-                    .unwrap_or_default()
+                (retry(|| game.read_pointer_path32::<Address32>(ptr + offset1, &[0, offset2]))
+                    .await
                     + offset3)
                     .into()
             }
@@ -355,90 +407,104 @@ impl Addresses {
 
         match game_version {
             GameVersion::Retail => {
-                demo_mode = pointerpath(0x4 * 11, 16, 0x1AC, true);
-                level_id_type = pointerpath(0x4 * 119, 12, 0, true);
-                level_id = pointerpath(0x4 * 120, 12, 0, true);
-                timer_is_running = pointerpath(0x4 * 121, 11, 0, true);
-                state = pointerpath(0x4 * 19, 18, 0x1078, true);
-                score_tally_state = pointerpath(0x4 * 19, 18, 0x7F8, true);
-                time_bonus = pointerpath(0x4 * 37, 18, 0x7F8, true);
-                bhp_good = pointerpath(0x4 * 32, 18, 0x37C8, true);
-                bhp_bad = pointerpath(0x4 * 32, 18, 0x380C, true);
+                demo_mode = pointerpath(0x4 * 11, 16, 0x1AC, true).await;
+                level_id_type = pointerpath(0x4 * 119, 12, 0, true).await;
+                level_id = pointerpath(0x4 * 120, 12, 0, true).await;
+                timer_is_running = pointerpath(0x4 * 121, 11, 0, true).await;
+                state = pointerpath(0x4 * 19, 18, 0x1078, true).await;
+                score_tally_state = pointerpath(0x4 * 19, 18, 0x7F8, true).await;
+                time_bonus = pointerpath(0x4 * 37, 18, 0x7F8, true).await;
+                bhp_good = pointerpath(0x4 * 32, 18, 0x37C8, true).await;
+                bhp_bad = pointerpath(0x4 * 32, 18, 0x380C, true).await;
 
-                let ptr = SIG32_RETAIL_CENTISECS
-                    .scan_process_range(game, (main_module_base, main_module_size))?;
-                centisecs = game.read::<Address32>(ptr + 1).ok()?.into();
-                seconds = game.read::<Address32>(ptr + 35).ok()?.into();
-                minutes = game.read::<Address32>(ptr + 69).ok()?.into();
+                let ptr = retry(|| {
+                    SIG32_RETAIL_CENTISECS
+                        .scan_process_range(game, (main_module_base, main_module_size))
+                })
+                .await;
+                centisecs = retry(|| game.read::<Address32>(ptr + 1)).await.into();
+                seconds = retry(|| game.read::<Address32>(ptr + 35)).await.into();
+                minutes = retry(|| game.read::<Address32>(ptr + 69)).await.into();
             }
             GameVersion::Decompilation32bit1_0_0 => {
-                demo_mode = pointerpath(0x4 * 11, 10, 0x1AC, true);
-                level_id_type = pointerpath(0x4 * 119, 8, 0, true);
-                level_id = pointerpath(0x4 * 120, 8, 0, true);
-                timer_is_running = pointerpath(0x4 * 121, 11, 0, true);
-                state = pointerpath(0x4 * 19, 17, 0x1078, true);
-                score_tally_state = pointerpath(0x4 * 19, 17, 0x7F8, true);
-                time_bonus = pointerpath(0x4 * 37, 17, 0x7F8, true);
-                bhp_good = pointerpath(0x4 * 32, 17, 0x37C8, true);
-                bhp_bad = pointerpath(0x4 * 32, 17, 0x380C, true);
+                demo_mode = pointerpath(0x4 * 11, 10, 0x1AC, true).await;
+                level_id_type = pointerpath(0x4 * 119, 8, 0, true).await;
+                level_id = pointerpath(0x4 * 120, 8, 0, true).await;
+                timer_is_running = pointerpath(0x4 * 121, 11, 0, true).await;
+                state = pointerpath(0x4 * 19, 17, 0x1078, true).await;
+                score_tally_state = pointerpath(0x4 * 19, 17, 0x7F8, true).await;
+                time_bonus = pointerpath(0x4 * 37, 17, 0x7F8, true).await;
+                bhp_good = pointerpath(0x4 * 32, 17, 0x37C8, true).await;
+                bhp_bad = pointerpath(0x4 * 32, 17, 0x380C, true).await;
 
-                let ptr = SIG32_DECOMP_CENTISECS
-                    .scan_process_range(game, (main_module_base, main_module_size))?;
-                centisecs = game.read::<Address32>(ptr + 2).ok()?.into();
-                seconds = game.read::<Address32>(ptr + 29).ok()?.into();
-                minutes = game.read::<Address32>(ptr + 51).ok()?.into();
+                let ptr = retry(|| {
+                    SIG32_DECOMP_CENTISECS
+                        .scan_process_range(game, (main_module_base, main_module_size))
+                })
+                .await;
+                centisecs = retry(|| game.read::<Address32>(ptr + 2)).await.into();
+                seconds = retry(|| game.read::<Address32>(ptr + 29)).await.into();
+                minutes = retry(|| game.read::<Address32>(ptr + 51)).await.into();
             }
             GameVersion::Decompilation32bit1_3_1 => {
-                demo_mode = pointerpath(0x4 * 11, 10, 0x1AC, true);
-                level_id_type = pointerpath(0x4 * 119, 9, 0, true);
-                level_id = pointerpath(0x4 * 120, 9, 0, true);
-                timer_is_running = pointerpath(0x4 * 121, 11, 0, true);
-                state = pointerpath(0x4 * 19, 17, 0x1078, true);
-                score_tally_state = pointerpath(0x4 * 19, 17, 0x7F8, true);
-                time_bonus = pointerpath(0x4 * 37, 17, 0x7F8, true);
-                bhp_good = pointerpath(0x4 * 32, 17, 0x37C8, true);
-                bhp_bad = pointerpath(0x4 * 32, 17, 0x380C, true);
+                demo_mode = pointerpath(0x4 * 11, 10, 0x1AC, true).await;
+                level_id_type = pointerpath(0x4 * 119, 9, 0, true).await;
+                level_id = pointerpath(0x4 * 120, 9, 0, true).await;
+                timer_is_running = pointerpath(0x4 * 121, 11, 0, true).await;
+                state = pointerpath(0x4 * 19, 17, 0x1078, true).await;
+                score_tally_state = pointerpath(0x4 * 19, 17, 0x7F8, true).await;
+                time_bonus = pointerpath(0x4 * 37, 17, 0x7F8, true).await;
+                bhp_good = pointerpath(0x4 * 32, 17, 0x37C8, true).await;
+                bhp_bad = pointerpath(0x4 * 32, 17, 0x380C, true).await;
 
-                let ptr = SIG32_DECOMP_CENTISECS
-                    .scan_process_range(game, (main_module_base, main_module_size))?;
-                centisecs = game.read::<Address32>(ptr + 2).ok()?.into();
-                seconds = game.read::<Address32>(ptr + 29).ok()?.into();
-                minutes = game.read::<Address32>(ptr + 51).ok()?.into();
+                let ptr = retry(|| {
+                    SIG32_DECOMP_CENTISECS
+                        .scan_process_range(game, (main_module_base, main_module_size))
+                })
+                .await;
+                centisecs = retry(|| game.read::<Address32>(ptr + 2)).await.into();
+                seconds = retry(|| game.read::<Address32>(ptr + 29)).await.into();
+                minutes = retry(|| game.read::<Address32>(ptr + 51)).await.into();
             }
-            GameVersion::Decompilation64bit1_0_0 | GameVersion::Decompilation64bit1_3_1 => {
-                demo_mode = pointerpath(0x4 * 11, 15, 0x1AC, true);
-                level_id_type = pointerpath(0x4 * 119, 10, 0, false);
-                level_id = pointerpath(0x4 * 120, 10, 0, false);
-                timer_is_running = pointerpath(0x4 * 121, 12, 0, false);
-                state = pointerpath(0, 0, 0x10B2, false);
-                score_tally_state = pointerpath(0, 0, 0x832, false);
-                time_bonus = pointerpath(0, 0, 0x814, false);
-                bhp_good = pointerpath(0, 0, 0x37D0, false);
-                bhp_bad = pointerpath(0, 0, 0x3814, false);
+            GameVersion::Decompilation64bit1_0_0
+            | GameVersion::Decompilation64bit1_3_1
+            | GameVersion::Decompilation64bit1_3_2 => {
+                demo_mode = pointerpath(0x4 * 11, 15, 0x1AC, true).await;
+                level_id_type = pointerpath(0x4 * 119, 10, 0, false).await;
+                level_id = pointerpath(0x4 * 120, 10, 0, false).await;
+                timer_is_running = pointerpath(0x4 * 121, 12, 0, false).await;
+                state = pointerpath(0, 0, 0x10B2, false).await;
+                score_tally_state = pointerpath(0, 0, 0x832, false).await;
+                time_bonus = pointerpath(0, 0, 0x814, false).await;
+                bhp_good = pointerpath(0, 0, 0x37D0, false).await;
+                bhp_bad = pointerpath(0, 0, 0x3814, false).await;
 
                 if let Some(ptr) = SIG64_DECOMP_CENTISECS
                     .scan_process_range(game, (main_module_base, main_module_size))
                 {
                     let mut addr = ptr + 2;
-                    centisecs = addr + 0x4 + game.read::<u32>(addr).ok()?;
+                    centisecs = addr + 0x4 + retry(|| game.read::<u32>(addr)).await;
                     addr = ptr + 29;
-                    seconds = addr + 0x4 + game.read::<u32>(addr).ok()?;
+                    seconds = addr + 0x4 + retry(|| game.read::<u32>(addr)).await;
                     addr = ptr + 54;
-                    minutes = addr + 0x4 + game.read::<u32>(addr).ok()?;
+                    minutes = addr + 0x4 + retry(|| game.read::<u32>(addr)).await;
                 } else {
-                    let ptr = SIG64_DECOMP_CENTISECS_ALT
-                        .scan_process_range(game, (main_module_base, main_module_size))?;
+                    let ptr = retry(|| {
+                        SIG64_DECOMP_CENTISECS_ALT
+                            .scan_process_range(game, (main_module_base, main_module_size))
+                    })
+                    .await;
                     let mut addr = ptr + 2;
-                    centisecs = addr + 0x4 + game.read::<u32>(addr).ok()? as u64;
+                    centisecs = addr + 0x4 + retry(|| game.read::<u32>(addr)).await as u64;
                     addr = ptr + 31;
-                    seconds = addr + 0x4 + game.read::<u32>(addr).ok()? as u64;
+                    seconds = addr + 0x4 + retry(|| game.read::<u32>(addr)).await as u64;
                     addr = ptr + 57;
-                    minutes = addr + 0x4 + game.read::<u32>(addr).ok()? as u64;
+                    minutes = addr + 0x4 + retry(|| game.read::<u32>(addr)).await as u64;
                 }
             }
         };
 
-        Some(Self {
+        Self {
             demo_mode,
             state,
             score_tally_state,
@@ -452,44 +518,36 @@ impl Addresses {
             minutes,
             centisecs,
             has_centisecs_bug,
-        })
+        }
     }
 }
 
 fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
     // LiveSplit's timer state, defined inside a watcher in order to define some actions when the timer starts or resets
-    let Some(timer_state) = watchers.livesplit_timer_state.update(Some(timer::state())) else {
-        return;
-    };
+    let timer_state = watchers
+        .livesplit_timer_state
+        .update_infallible(timer::state());
 
     // Update standard values
-    watchers.demo_mode.update(Some(
-        game.read::<u8>(addresses.demo_mode)
-            .ok()
-            .unwrap_or_default()
-            > 0,
-    ));
+    watchers
+        .demo_mode
+        .update_infallible(game.read::<u8>(addresses.demo_mode).unwrap_or_default() > 0);
     watchers.state.update(game.read(addresses.state).ok());
-    watchers.timer_is_running.update(Some(
+    watchers.timer_is_running.update_infallible(
         game.read::<u8>(addresses.timer_is_running)
             .ok()
             .unwrap_or_default()
             > 0,
-    ));
+    );
 
     // Level ID
     match game
         .read::<u8>(addresses.score_tally_state)
-        .ok()
         .unwrap_or_default()
     {
         0 => {
-            let lid = game
-                .read::<u8>(addresses.level_id_type)
-                .ok()
-                .unwrap_or_default() as u32
-                * 100
-                + game.read::<u8>(addresses.level_id).ok().unwrap_or_default() as u32;
+            let lid = game.read::<u8>(addresses.level_id_type).unwrap_or_default() as u32 * 100
+                + game.read::<u8>(addresses.level_id).unwrap_or_default() as u32;
             let current_act = match lid {
                 0 => Acts::TitleScreen,
                 1 => Acts::MainMenu,
@@ -521,23 +579,25 @@ fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
                     _ => Acts::PalmtreePanicAct1,
                 },
             };
-            watchers.level_id.update(Some(current_act));
+            watchers.level_id.update_infallible(current_act);
 
             let final_boss_health = match lid {
-                168 => game.read::<u8>(addresses.bhp_good).ok().unwrap_or_default(),
-                169 => game.read::<u8>(addresses.bhp_bad).ok().unwrap_or_default(),
+                168 => game.read::<u8>(addresses.bhp_good).unwrap_or_default(),
+                169 => game.read::<u8>(addresses.bhp_bad).unwrap_or_default(),
                 _ => 0xFF,
             };
-            watchers.final_boss_health.update(Some(final_boss_health));
+            watchers
+                .final_boss_health
+                .update_infallible(final_boss_health);
         }
         _ => {
             watchers
                 .level_id
-                .update(Some(match &watchers.level_id.pair {
+                .update_infallible(match &watchers.level_id.pair {
                     Some(x) => x.current,
                     _ => Acts::PalmtreePanicAct1,
-                }));
-            watchers.final_boss_health.update(Some(0xFF));
+                });
+            watchers.final_boss_health.update_infallible(0xFF);
         }
     };
 
@@ -549,18 +609,10 @@ fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
         return;
     };
 
-    let centisecs = (game
-        .read::<u8>(addresses.centisecs)
-        .ok()
-        .unwrap_or_default() as u64
-        * 100)
-        / 60;
-    let Some(centis) = watchers
+    let centisecs = (game.read::<u8>(addresses.centisecs).unwrap_or_default() as u64 * 100) / 60;
+    let centis = watchers
         .centisecs
-        .update(Some(Duration::milliseconds(centisecs as i64 * 10)))
-    else {
-        return;
-    };
+        .update_infallible(Duration::milliseconds(centisecs as i64 * 10));
 
     let new_igt =
         if demo_mode.current || demo_mode.old || timer_state.current == TimerState::NotRunning {
@@ -571,8 +623,8 @@ fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
                 _ => Duration::ZERO,
             }
         } else {
-            let mins = game.read::<u8>(addresses.minutes).ok().unwrap_or_default() as u64;
-            let secs = game.read::<u8>(addresses.seconds).ok().unwrap_or_default() as u64;
+            let mins = game.read::<u8>(addresses.minutes).unwrap_or_default() as u64;
+            let secs = game.read::<u8>(addresses.seconds).unwrap_or_default() as u64;
             Duration::milliseconds(
                 (mins * 60000
                     + secs * 1000
@@ -583,9 +635,7 @@ fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
                     } * 10) as i64,
             )
         };
-    let Some(final_igt) = watchers.igt.update(Some(new_igt)) else {
-        return;
-    };
+    let final_igt = watchers.igt.update_infallible(new_igt);
 
     // Reset the buffer IGT variables when the timer is stopped
     if timer_state.current == TimerState::NotRunning {
@@ -594,27 +644,24 @@ fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
         watchers.igt_offset = Duration::ZERO;
     }
 
-    if final_igt.old > final_igt.current {
+    if final_igt.decreased() {
         watchers.accumulated_igt += final_igt.old - watchers.buffer_igt;
         watchers.buffer_igt = final_igt.current;
     }
 
     // Set the IGT offset when starting a new run, if the game has the centisecs bug
     if addresses.has_centisecs_bug
-        && timer_state.old == TimerState::NotRunning
-        && timer_state.current == TimerState::Running
+        && timer_state.changed_from_to(&TimerState::NotRunning, &TimerState::Running)
     {
         watchers.igt_offset = centis.current;
     }
 
     // Time bonus start value
-    let Some(time_bonus) = watchers
+    let time_bonus = watchers
         .time_bonus
-        .update(game.read::<u32>(addresses.time_bonus).ok())
-    else {
-        return;
-    };
-    if time_bonus.old == 0 && time_bonus.changed() {
+        .update_infallible(game.read::<u32>(addresses.time_bonus).unwrap_or_default());
+
+    if time_bonus.changed_from(&0) {
         watchers.time_bonus_start_value = time_bonus.current
     } else if time_bonus.current == 0 {
         watchers.time_bonus_start_value = 0
@@ -622,24 +669,19 @@ fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
 }
 
 fn start(watchers: &Watchers, settings: &Settings) -> bool {
-    if !settings.start {
-        return false;
-    }
-    let Some(act) = &watchers.level_id.pair else {
-        return false;
-    };
-    let Some(state) = &watchers.state.pair else {
-        return false;
-    };
-    act.current == Acts::MainMenu && state.current == 7 && state.old == 6
+    settings.start
+        && watchers
+            .level_id
+            .pair
+            .is_some_and(|act| act.current == Acts::MainMenu)
+        && watchers
+            .state
+            .pair
+            .is_some_and(|state| state.changed_from_to(&6, &7))
 }
 
 fn split(watchers: &Watchers, settings: &Settings) -> bool {
-    let Some(act) = &watchers.level_id.pair else {
-        return false;
-    };
-
-    match act.old {
+    watchers.level_id.pair.is_some_and(|act| match act.old {
         Acts::PalmtreePanicAct1 => {
             settings.palmtree_panic_1 && act.current == Acts::PalmtreePanicAct2
         }
@@ -697,65 +739,64 @@ fn split(watchers: &Watchers, settings: &Settings) -> bool {
             settings.metallic_madness_2 && act.current == Acts::MetallicMadnessAct3
         }
         Acts::MetallicMadnessAct3 => {
-            settings.metallic_madness_3 && {
-                let Some(finalboss_hp) = &watchers.final_boss_health.pair else {
-                    return false;
-                };
-                let Some(igt) = &watchers.igt.pair else {
-                    return false;
-                };
-                if settings.rta_tb {
+            settings.metallic_madness_3
+                && if settings.rta_tb {
                     (act.current == Acts::Credits || act.current == Acts::MainMenu)
-                        && finalboss_hp.old == 0
-                        && igt.old != Duration::ZERO
+                        && watchers
+                            .final_boss_health
+                            .pair
+                            .is_some_and(|finalboss_hp| finalboss_hp.old == 0)
+                        && watchers
+                            .igt
+                            .pair
+                            .is_some_and(|igt| igt.old != Duration::ZERO)
                 } else {
-                    finalboss_hp.old == 1
-                        && finalboss_hp.current == 0
-                        && igt.current != Duration::ZERO
+                    watchers
+                        .final_boss_health
+                        .pair
+                        .is_some_and(|finalboss_hp| finalboss_hp.changed_from_to(&1, &0))
+                        && watchers
+                            .igt
+                            .pair
+                            .is_some_and(|igt| igt.current != Duration::ZERO)
                 }
-            }
         }
         _ => false,
-    }
+    })
 }
 
 fn reset(watchers: &Watchers, settings: &Settings) -> bool {
-    if !settings.reset {
-        return false;
-    }
-    let Some(act) = &watchers.level_id.pair else {
-        return false;
-    };
-    let Some(state) = &watchers.state.pair else {
-        return false;
-    };
-    act.current == Acts::MainMenu && state.current == 5 && state.changed()
+    settings.reset
+        && watchers
+            .level_id
+            .pair
+            .is_some_and(|act| act.current == Acts::MainMenu)
+        && watchers
+            .state
+            .pair
+            .is_some_and(|state| state.changed_to(&5))
 }
 
 fn is_loading(watchers: &Watchers, settings: &Settings) -> Option<bool> {
-    if settings.rta_tb {
-        let Some(time_bonus) = &watchers.time_bonus.pair else {
-            return None;
-        };
-        Some(
-            watchers.time_bonus_start_value != 0
-                && time_bonus.current != watchers.time_bonus_start_value,
-        )
+    Some(if settings.rta_tb {
+        watchers.time_bonus_start_value != 0
+            && watchers
+                .time_bonus
+                .pair
+                .is_some_and(|time_bonus| time_bonus.current != watchers.time_bonus_start_value)
     } else {
-        Some(true)
-    }
+        true
+    })
 }
 
 fn game_time(watchers: &Watchers, settings: &Settings, addresses: &Addresses) -> Option<Duration> {
     if settings.rta_tb {
         None
     } else {
-        let Some(igt) = &watchers.igt.pair else {
+        let (Some(igt), Some(centisecs)) = (&watchers.igt.pair, &watchers.centisecs.pair) else {
             return None;
         };
-        let Some(centisecs) = &watchers.centisecs.pair else {
-            return None;
-        };
+
         Some(
             igt.current + watchers.accumulated_igt - watchers.buffer_igt - watchers.igt_offset
                 + if addresses.has_centisecs_bug {
@@ -767,7 +808,7 @@ fn game_time(watchers: &Watchers, settings: &Settings, addresses: &Addresses) ->
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Acts {
     TitleScreen,
     MainMenu,
@@ -796,16 +837,17 @@ enum Acts {
     Credits,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum GameVersion {
     Retail,
     Decompilation32bit1_0_0, // Valid from base version up tp v1.3.0)
     Decompilation32bit1_3_1, // Valid from v1.3.1 onwards
     Decompilation64bit1_0_0,
     Decompilation64bit1_3_1,
+    Decompilation64bit1_3_2, // Valid from v1.3.2 64bit onwards
 }
 
-const PROCESS_NAMES: [&str; 9] = [
+const PROCESS_NAMES: &[&str] = &[
     "soniccd.exe",
     "RSDKv3.exe",
     "RSDKv3_64.exe",
@@ -828,6 +870,7 @@ const SIG32_DECOMP_TIMERBUG: Signature<34> = Signature::new("C6 05 ?? ?? ?? ?? 0
 
 const SIG64_DECOMP_1_0_0: Signature<11> = Signature::new("41 8B 8C 8C ?? ?? ?? ?? 49 03 CC");
 const SIG64_DECOMP_1_3_1: Signature<9> = Signature::new("41 8B 94 95 ?? ?? ?? ?? 49");
+const SIG64_DECOMP_1_3_2: Signature<9> = Signature::new("41 8B 94 92 ?? ?? ?? ?? 49");
 const SIG64_DECOMP_1_0_0_LEA: Signature<10> = Signature::new("4C 8D 35 ?? ?? ?? ?? 44 8B 1D"); // Signature::new("4C 8D 35 ?? ?? ?? ?? 66 90");
 const SIG64_DECOMP_CENTISECS: Signature<11> = Signature::new("89 0D ?? ?? ?? ?? 41 3B C8 75 3A");
 const SIG64_DECOMP_CENTISECS_ALT: Signature<11> =
