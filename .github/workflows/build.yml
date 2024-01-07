@@ -50,7 +50,7 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Run Clippy
-        run: cargo clippy --all-features
+        run: cargo clippy --release --all-features
 
   format:
     name: Check formatting
