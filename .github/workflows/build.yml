@@ -25,7 +25,7 @@ jobs:
 
       - name: Build
         run: |
-          cargo b --release --locked
+          cargo b --release
 
       - name: Release
         if: github.ref == 'refs/heads/master'
@@ -46,6 +46,7 @@ jobs:
         uses: hecrj/setup-rust-action@v1
         with:
           components: clippy
+          rust-version: nightly
           targets: wasm32-unknown-unknown
 
       - name: Run Clippy
