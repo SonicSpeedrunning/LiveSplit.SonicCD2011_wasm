@@ -12,7 +12,7 @@
 use asr::{
     file_format::pe::{self, MachineType},
     future::{next_tick, retry},
-    settings::Gui,
+    settings::{gui::Title, Gui},
     signature::Signature,
     time::Duration,
     timer::{self, TimerState},
@@ -28,7 +28,12 @@ async fn main() {
 
     loop {
         // Hook to the target process
-        let process = retry(|| PROCESS_NAMES.iter().find_map(|&name| Process::attach(name))).await;
+        let (process_name, process) = retry(|| {
+            PROCESS_NAMES
+                .iter()
+                .find_map(|&name| Some((name, Process::attach(name)?)))
+        })
+        .await;
 
         process
             .until_closes(async {
@@ -36,7 +41,7 @@ async fn main() {
                 let mut watchers = Watchers::default();
 
                 // Perform memory scanning to look for the addresses we need
-                let addresses = Addresses::init(&process).await;
+                let addresses = Addresses::init(&process, process_name).await;
 
                 loop {
                     // Splitting logic. Adapted from OG LiveSplit:
@@ -48,37 +53,35 @@ async fn main() {
                     settings.update();
                     update_loop(&process, &addresses, &mut watchers);
 
-                    let timer_state = timer::state();
-                    if timer_state == TimerState::Running || timer_state == TimerState::Paused {
-                        if let Some(is_loading) = is_loading(&watchers, &settings) {
-                            if is_loading {
-                                timer::pause_game_time()
-                            } else {
-                                timer::resume_game_time()
+                    if [TimerState::Running, TimerState::Paused].contains(&timer::state()) {
+                        match is_loading(&watchers, &settings) {
+                            Some(true) => timer::pause_game_time(),
+                            Some(false) => timer::resume_game_time(),
+                            _ => (),
+                        }
+
+                        match game_time(&watchers, &settings, &addresses) {
+                            Some(x) => timer::set_game_time(x),
+                            _ => (),
+                        }
+
+                        match reset(&watchers, &settings) {
+                            true => timer::reset(),
+                            _ => match split(&watchers, &settings) {
+                                true => timer::split(),
+                                _ => (),
                             }
-                        }
-
-                        if let Some(game_time) = game_time(&watchers, &settings, &addresses) {
-                            timer::set_game_time(game_time)
-                        }
-
-                        if reset(&watchers, &settings) {
-                            timer::reset()
-                        } else if split(&watchers, &settings) {
-                            timer::split()
                         }
                     }
 
-                    if timer::state() == TimerState::NotRunning && start(&watchers, &settings) {
+                    if timer::state().eq(&TimerState::NotRunning) && start(&watchers, &settings) {
                         timer::start();
                         timer::pause_game_time();
 
-                        if let Some(is_loading) = is_loading(&watchers, &settings) {
-                            if is_loading {
-                                timer::pause_game_time()
-                            } else {
-                                timer::resume_game_time()
-                            }
+                        match is_loading(&watchers, &settings) {
+                            Some(true) => timer::pause_game_time(),
+                            Some(false) => timer::resume_game_time(),
+                            _ => (),
                         }
                     }
 
@@ -91,15 +94,25 @@ async fn main() {
 
 #[derive(Gui)]
 struct Settings {
+    /// General settings
+    _general: Title,
     #[default = true]
-    /// START --> Enable auto start
+    /// Auto start
     start: bool,
     #[default = true]
-    /// RESET --> Enable auto reset
+    /// Auto reset
     reset: bool,
+    /// Timing
+    _timing: Title,
     #[default = false]
-    /// TIMING --> Use All Time Stones timing rules (RTA-TB)
+    /// Use All Time Stones timing rules (RTA-TB)
+    ///
+    /// If checked, LiveSplit will calculate game time as RTA-TB instead of IGT.
+    /// This setting should be enabled when running the "All Time Stones" speedrun
+    /// category, as per speedrun.com rulings.
     rta_tb: bool,
+    /// Split settings
+    _split: Title,
     #[default = true]
     /// Palmtree Panic - Act 1
     palmtree_panic_1: bool,
@@ -174,7 +187,7 @@ struct Watchers {
     demo_mode: Watcher<bool>,
     state: Watcher<u8>,
     time_bonus: Watcher<u32>,
-    final_boss_health: Watcher<u8>,
+    final_boss_health: Watcher<Option<u8>>,
     level_id: Watcher<Acts>,
     timer_is_running: Watcher<bool>,
     igt: Watcher<Duration>,
@@ -199,13 +212,8 @@ struct Addresses {
 }
 
 impl Addresses {
-    async fn init(game: &Process) -> Self {
-        let main_module_base = retry(|| {
-            PROCESS_NAMES
-                .iter()
-                .find_map(|&p| game.get_module_address(p).ok())
-        })
-        .await;
+    async fn init(game: &Process, main_module_name: &str) -> Self {
+        let main_module_base = retry(|| game.get_module_address(main_module_name)).await;
 
         let main_module_size =
             retry(|| pe::read_size_of_image(game, main_module_base)).await as u64;
@@ -582,9 +590,9 @@ fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
             watchers.level_id.update_infallible(current_act);
 
             let final_boss_health = match lid {
-                168 => game.read::<u8>(addresses.bhp_good).unwrap_or_default(),
-                169 => game.read::<u8>(addresses.bhp_bad).unwrap_or_default(),
-                _ => 0xFF,
+                168 => game.read::<u8>(addresses.bhp_good).ok(),
+                169 => game.read::<u8>(addresses.bhp_bad).ok(),
+                _ => None,
             };
             watchers
                 .final_boss_health
@@ -597,7 +605,7 @@ fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
                     Some(x) => x.current,
                     _ => Acts::PalmtreePanicAct1,
                 });
-            watchers.final_boss_health.update_infallible(0xFF);
+            watchers.final_boss_health.update_infallible(None);
         }
     };
 
@@ -742,23 +750,20 @@ fn split(watchers: &Watchers, settings: &Settings) -> bool {
             settings.metallic_madness_3
                 && if settings.rta_tb {
                     (act.current == Acts::Credits || act.current == Acts::MainMenu)
-                        && watchers
-                            .final_boss_health
-                            .pair
-                            .is_some_and(|finalboss_hp| finalboss_hp.old == 0)
+                        && watchers.final_boss_health.pair.is_some_and(|finalboss_hp| {
+                            finalboss_hp.old.is_some_and(|val| val == 0)
+                        })
                         && watchers
                             .igt
                             .pair
                             .is_some_and(|igt| igt.old != Duration::ZERO)
                 } else {
-                    watchers
-                        .final_boss_health
+                    watchers.final_boss_health.pair.is_some_and(|finalboss_hp| {
+                        finalboss_hp.changed_from_to(&Some(1), &Some(0))
+                    }) && watchers
+                        .igt
                         .pair
-                        .is_some_and(|finalboss_hp| finalboss_hp.changed_from_to(&1, &0))
-                        && watchers
-                            .igt
-                            .pair
-                            .is_some_and(|igt| igt.current != Duration::ZERO)
+                        .is_some_and(|igt| igt.current != Duration::ZERO)
                 }
         }
         _ => false,
